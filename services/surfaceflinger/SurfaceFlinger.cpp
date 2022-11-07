@@ -127,6 +127,8 @@
 #include "android-base/parseint.h"
 #include "android-base/stringprintf.h"
 
+#include <hardware_legacy/uevent.h>
+
 #ifdef QCOM_UM_FAMILY
 #if __has_include("QtiGralloc.h")
 #include "QtiGralloc.h"
@@ -147,6 +149,8 @@
 #undef NO_THREAD_SAFETY_ANALYSIS
 #define NO_THREAD_SAFETY_ANALYSIS \
     _Pragma("GCC error \"Prefer MAIN_THREAD macros or {Conditional,Timed,Unnecessary}Lock.\"")
+
+#define SP_UEVENT_SWITCH_HDMI  "change@/devices/virtual/switch/hdmi"
 
 namespace android {
 
@@ -316,6 +320,34 @@ std::string decodeDisplayColorSetting(DisplayColorSetting displayColorSetting) {
     }
 }
 
+bool isRestartOnHotPlugDispResMismatchEnabled() {
+    char value[PROPERTY_VALUE_MAX] = {};
+    property_get("persist.enplug.sf.restart.on.res.differ", value, "true");
+    ALOGI("Restart on hot plug display resolution mismatch detected: '%s'", value);
+    return std::string(value) == "true";
+}
+
+bool isRestartOnHotPlugEdidMismatchEnabled() {
+    char value[PROPERTY_VALUE_MAX] = {};
+    property_get("persist.enplug.sf.restart.on.edid.differ", value, "false");
+    ALOGI("Restart on hot plug display edid changed: '%s'", value);
+    return std::string(value) == "true";
+}
+
+int getDisplayUiResolutionWidth() {
+    char value[PROPERTY_VALUE_MAX] = {};
+    property_get("vendor.sys.ui.resolution.x", value, "1920");
+    ALOGI("System UI resolution X: '%s'", value);
+    return atoi(value);
+}
+
+int getDisplayUiResolutionHeight() {
+    char value[PROPERTY_VALUE_MAX] = {};
+    property_get("vendor.sys.ui.resolution.y", value, "1080");
+    ALOGI("System UI resolution Y: '%s'", value);
+    return atoi(value);
+}
+
 SurfaceFlingerBE::SurfaceFlingerBE() : mHwcServiceName(getHwcServiceName()) {}
 
 SurfaceFlinger::SurfaceFlinger(Factory& factory, SkipInitializationTag)
@@ -452,6 +484,16 @@ SurfaceFlinger::SurfaceFlinger(Factory& factory) : SurfaceFlinger(factory, SkipI
         setenv("TREBLE_TESTING_OVERRIDE", "true", true);
     }
 
+    if (isRestartOnHotPlugDispResMismatchEnabled()) {
+        if (isRestartOnHotPlugEdidMismatchEnabled()) {
+            getEdidChecksum(mPreviousEdidMd5, MD5_SUM_LENGTH);
+        }
+        // Initialize HDMI plug detector,
+        // which will kill (and restart) SF process
+        // when display viewport and frame resolution mismatch
+        initUEventHandler();
+    }
+
     useFrameRateApi = use_frame_rate_api(true);
 
     mKernelIdleTimerEnabled = mSupportKernelIdleTimer = sysprop::support_kernel_idle_timer(false);
@@ -462,6 +504,104 @@ SurfaceFlinger::~SurfaceFlinger() = default;
 
 void SurfaceFlinger::onFirstRef() {
     mEventQueue->init(this);
+}
+
+static int getSwitchStateFromUEvent(const char* strUdata, int len)
+{
+    const char* iter_str = strUdata;
+    while(((iter_str - strUdata) <= len) && (*iter_str)) {
+        const char* pstr = strstr(iter_str, "SWITCH_STATE=");
+        if (pstr != NULL) {
+            return (atoi(pstr + strlen("SWITCH_STATE=")));
+        }
+        iter_str += strlen(iter_str)+1;
+    }
+    return -1;
+}
+
+bool SurfaceFlinger::getEdidChecksum(char* buffer, size_t length) {
+    bool result = false;
+    FILE *f = popen("md5sum /sys/kernel/debug/tegradc.0/edid", "r");
+
+    if (f) {
+        if (fgets(buffer, length, f) != NULL) {
+            ALOGI("EDID checksum: %s", buffer);
+            result = true;
+        } else {
+            ALOGI("EDID sum get failed (1)");
+        }
+        pclose(f);
+    } else {
+        ALOGI("EDID sum get failed (1)");
+    }
+
+    return result;
+}
+
+void SurfaceFlinger::triggerDisplaySanityCheck() {
+    Mutex::Autolock _l(mStateLock);
+    sp<const DisplayDevice> defaultDisplayDevice(getDefaultDisplayDeviceLocked());
+    const Rect viewport = defaultDisplayDevice->getViewport();
+    const Rect frame = defaultDisplayDevice->getFrame();
+    bool isViewportFrameSizesMismatch = viewport.width() != frame.width() || viewport.height() != frame.height();
+    int uiWidth = getDisplayUiResolutionWidth();
+    int uiHeight = getDisplayUiResolutionHeight();
+    bool isUiDisplaySizesMismatch = uiWidth != defaultDisplayDevice->getWidth() || uiHeight != defaultDisplayDevice->getHeight();
+
+    if (isViewportFrameSizesMismatch || isUiDisplaySizesMismatch) {
+        // do suicide, SurfaceFlinger will be restarted
+        ALOGW("Detected viewport and frame size inconsistency, exit");
+        exit(0);
+    }
+
+    // check edid changed
+    if (isRestartOnHotPlugEdidMismatchEnabled()) {
+        char currentEdidMd5[MD5_SUM_LENGTH +1] = {0};
+        getEdidChecksum(currentEdidMd5, MD5_SUM_LENGTH);
+        ALOGI("Current EDID sum: %s", currentEdidMd5);
+
+        if (memcmp(mPreviousEdidMd5, currentEdidMd5, MD5_SUM_LENGTH)) {
+            ALOGI("EDID changed: %s -> %s", mPreviousEdidMd5, currentEdidMd5);
+            memcpy(mPreviousEdidMd5, currentEdidMd5, MD5_SUM_LENGTH );
+            // do suicide, SurfaceFlinger will be restarted
+            exit(0);
+        } else {
+            ALOGI("EDID still the same: %s = %s", mPreviousEdidMd5, currentEdidMd5);
+        }
+    }
+}
+
+void SurfaceFlinger::handleUEvent(const char* udata, int len) {
+
+    if (len > 0 && strcasestr(SP_UEVENT_SWITCH_HDMI, udata)) {
+        int isHdmiPlugConnected = getSwitchStateFromUEvent(udata, len);
+
+        if (isHdmiPlugConnected == 1) {         // handle only plug in event
+            triggerDisplaySanityCheck();
+        }
+    }
+}
+
+void SurfaceFlinger::uEventLoop()
+{
+    int len = 0;
+    static char udata[PAGE_SIZE];
+
+    if(!uevent_init()) {
+        ALOGE("%s: failed to init uevent ",__FUNCTION__);
+        return;
+    }
+
+    while(true) {
+        len = uevent_next_event(udata, (int)sizeof(udata) - 2);
+        handleUEvent(udata, len);
+    }
+}
+
+void SurfaceFlinger::initUEventHandler()
+{
+    ALOGD("Initializing UEVENT handler");
+    mUEventWorkerThread = std::thread([&]{ uEventLoop(); });
 }
 
 void SurfaceFlinger::binderDied(const wp<IBinder>&) {

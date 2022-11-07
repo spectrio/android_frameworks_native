@@ -996,6 +996,19 @@ private:
     void updateColorMatrixLocked();
 
     /* ------------------------------------------------------------------------
+     * UEvent
+     */
+    void initUEventHandler();
+    void uEventLoop();
+    void handleUEvent(const char* udata, int len);
+
+    static const size_t MD5_SUM_LENGTH = 32;
+    void triggerDisplaySanityCheck();
+    char mPreviousEdidMd5[MD5_SUM_LENGTH + 1];
+    bool getEdidChecksum(char* buffer, size_t length);
+
+    std::thread mUEventWorkerThread;
+    /* ------------------------------------------------------------------------
      * Attributes
      */
 

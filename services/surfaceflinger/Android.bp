@@ -48,6 +48,7 @@ cc_defaults {
         "libGLESv1_CM",
         "libGLESv2",
         "libgui",
+        "libhardware_legacy",
         "libhidlbase",
         "liblayers_proto",
         "liblog",
